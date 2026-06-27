@@ -16,7 +16,7 @@ from gsl_interpreter.labels import invert_labels
 from gsl_interpreter.overlay import draw_text, draw_text_batch
 from gsl_interpreter.smoothing import PredictionSmoother
 from gsl_interpreter.torch_model import best_device, build_model
-from gsl_interpreter.tts import DEFAULT_GEORGIAN_VOICE, GeorgianTTS, TTSQueueResult
+from gsl_interpreter.tts import DEFAULT_GEORGIAN_VOICE, DEFAULT_TTS_MODE, GeorgianTTS, TTSQueueResult
 
 WINDOW_NAME = "GSL Interpreter"
 BACKGROUND_LABELS = {"არაფერი"}
@@ -123,7 +123,7 @@ def run_inference(
     tracking_complexity: int = 1,
     sentence_log: str | None = "data/sentences.jsonl",
     autosave_sentences: bool = False,
-    tts_mode: str = "saved",
+    tts_mode: str = DEFAULT_TTS_MODE,
     tts_voice: str = DEFAULT_GEORGIAN_VOICE,
     tts_rate: str = "+0%",
     tts_volume: str = "+0%",
@@ -154,6 +154,7 @@ def run_inference(
         volume=tts_volume,
         cache_dir=tts_cache_dir,
     )
+    sentence_tts.prewarm(_spoken_labels(labels_by_id.values()))
     sequence: list[np.ndarray] = []
     previous_vector: np.ndarray | None = None
     motion_streak = 0
@@ -825,6 +826,9 @@ def _record_and_maybe_speak(
     save_result = sentence_recorder.record(sentence_words, event, source_label, confidence)
     if not save_result.saved or event not in SPOKEN_SAVE_EVENTS:
         return save_result, TTSQueueResult(False, "")
+    word_result = sentence_tts.speak_sentence_words(sentence_words, event)
+    if word_result.queued:
+        return save_result, word_result
     return save_result, sentence_tts.speak_sentence(_sentence_text(sentence_words), event)
 
 
@@ -832,6 +836,14 @@ def _with_tts_feedback(feedback: str, tts_result: TTSQueueResult) -> str:
     if not tts_result.message:
         return feedback
     return f"{feedback}; {tts_result.message}"
+
+
+def _spoken_labels(labels: object) -> list[str]:
+    spoken: list[str] = []
+    for label in labels:
+        if isinstance(label, str) and _should_speak_label(label):
+            spoken.append(label)
+    return sorted(set(spoken))
 
 
 def _shorten_text(text: str, max_chars: int) -> str:

@@ -79,16 +79,16 @@ The live inference window now records sentences instead of locking after one wor
 - Use the `Undo` button, `U`, or Backspace to remove the last word.
 - If you later train punctuation/control labels, `წერტილი`/`period`, `მძიმე`/`comma`, `კითხვის ნიშანი`/`question mark`, and `ძახილის ნიშანი`/`exclamation mark` are handled specially.
 
-Georgian TTS is enabled by default for saved sentences through `edge-tts` using the Microsoft `ka-GE-EkaNeural` voice. It needs internet the first time it synthesizes a new phrase, then caches MP3 files under `data/tts/`.
-
-```powershell
-.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-mode saved
-```
-
-Use word-by-word speech while recording, speak both words and saved sentences, switch to the male Georgian voice, or disable speech:
+Georgian TTS is enabled by default for recognized words through `edge-tts` using the Microsoft `ka-GE-EkaNeural` voice. Inference warms the label-audio cache in the background at startup, then reuses cached MP3 files under `data/tts/` for fast playback.
 
 ```powershell
 .\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-mode words
+```
+
+Use saved-sentence speech, speak both words and saved sentences, switch to the male Georgian voice, or disable speech:
+
+```powershell
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-mode saved
 .\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-mode all
 .\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-voice ka-GE-GiorgiNeural
 .\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-mode off

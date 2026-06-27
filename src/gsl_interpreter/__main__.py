@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 
-from gsl_interpreter.tts import DEFAULT_GEORGIAN_VOICE, TTS_MODE_CHOICES
+from gsl_interpreter.tts import DEFAULT_GEORGIAN_VOICE, DEFAULT_TTS_MODE, TTS_MODE_CHOICES
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,9 +59,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     infer.add_argument(
         "--tts-mode",
-        default="saved",
+        default=DEFAULT_TTS_MODE,
         choices=TTS_MODE_CHOICES,
-        help="Georgian speech mode: saved sentences, recognized words, both, or off",
+        help="Georgian speech mode: recognized words, saved sentences, both, or off",
     )
     infer.add_argument(
         "--tts-voice",
