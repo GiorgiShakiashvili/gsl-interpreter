@@ -14,6 +14,14 @@ from gsl_interpreter.tracking_overlay import draw_tracking
 
 RAW_DATA_DIR = Path("data/raw")
 MAX_EMPTY_FRAMES = int(NUM_FRAMES * 0.2)
+RECORDER_WINDOW = "GSL Recorder"
+SAVE_BUTTON = (20, 118, 190, 176)
+DISCARD_BUTTON = (210, 118, 420, 176)
+PANEL_BG = (18, 20, 23)
+TEXT = (240, 242, 245)
+MUTED_TEXT = (160, 168, 176)
+SUCCESS = (90, 190, 120)
+DANGER = (80, 90, 225)
 
 
 def record_samples(label: str, samples: int, signer: str, camera_index: int = 0) -> None:
@@ -23,6 +31,7 @@ def record_samples(label: str, samples: int, signer: str, camera_index: int = 0)
     _validate_path_part(signer, "signer")
 
     saved = 0
+    cv2.namedWindow(RECORDER_WINDOW)
     with Camera(camera_index) as camera:
         frames = camera.frames()
         while saved < samples:
@@ -33,9 +42,7 @@ def record_samples(label: str, samples: int, signer: str, camera_index: int = 0)
                 print("Capture aborted: too many empty hand-detection frames. Try again.")
                 continue
 
-            _show_preview(sample)
-            answer = input("Save this sample? [Y/n] ").strip().lower()
-            if answer in {"", "y", "yes"}:
+            if _confirm_save(frames, sample, label, saved + 1, samples):
                 ensure_label(label)
                 path = _sample_path(label, signer)
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,7 +121,7 @@ def _capture_sequence(frames: object) -> np.ndarray | None:
             (20, 25),
             (0, 255, 0),
         )
-        cv2.imshow("GSL Recorder", display)
+        cv2.imshow(RECORDER_WINDOW, display)
         cv2.waitKey(1)
 
         if vector is None:
@@ -141,13 +148,64 @@ def _countdown(frames: object, label: str, index: int, total: int) -> None:
                 (0, 255, 255),
             )
             display = draw_text(display, f"Label: {label}", (20, 70), (0, 255, 255))
-            cv2.imshow("GSL Recorder", display)
+            cv2.imshow(RECORDER_WINDOW, display)
             if cv2.waitKey(1) == 27:
                 raise KeyboardInterrupt
 
 
-def _show_preview(sample: np.ndarray) -> None:
+def _confirm_save(frames: object, sample: np.ndarray, label: str, index: int, total: int) -> bool:
     print(f"Captured sample shape={sample.shape}, dtype={sample.dtype}")
+    decision: bool | None = None
+
+    def on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
+        nonlocal decision
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if _point_in_rect(x, y, SAVE_BUTTON):
+            decision = True
+        elif _point_in_rect(x, y, DISCARD_BUTTON):
+            decision = False
+
+    cv2.setMouseCallback(RECORDER_WINDOW, on_mouse)
+    while decision is None:
+        frame = next(frames)
+        display = draw_tracking(frame)
+        display = _draw_confirmation_overlay(display, label, index, total)
+        cv2.imshow(RECORDER_WINDOW, display)
+        key = cv2.waitKey(1) & 0xFF
+        if key in {13, ord("y"), ord("Y"), ord("s"), ord("S")}:
+            decision = True
+        elif key in {27, ord("n"), ord("N"), ord("d"), ord("D")}:
+            decision = False
+
+    cv2.setMouseCallback(RECORDER_WINDOW, lambda *_args: None)
+    return decision
+
+
+def _draw_confirmation_overlay(frame: np.ndarray, label: str, index: int, total: int) -> np.ndarray:
+    panel = (14, 14, min(frame.shape[1] - 14, 460), 196)
+    cv2.rectangle(frame, (panel[0], panel[1]), (panel[2], panel[3]), PANEL_BG, -1)
+    cv2.rectangle(frame, (panel[0], panel[1]), (panel[2], panel[3]), (70, 76, 84), 1)
+    frame = draw_text(frame, f"Sample {index}/{total}", (28, 28), TEXT, size=28)
+    frame = draw_text(frame, f"Label: {label}", (28, 66), MUTED_TEXT, size=22)
+    frame = draw_text(frame, "Save captured sample?", (28, 92), TEXT, size=20)
+    frame = _draw_decision_button(frame, SAVE_BUTTON, "Save", SUCCESS)
+    return _draw_decision_button(frame, DISCARD_BUTTON, "Discard", DANGER)
+
+
+def _draw_decision_button(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    label: str,
+    color: tuple[int, int, int],
+) -> np.ndarray:
+    cv2.rectangle(frame, (rect[0], rect[1]), (rect[2], rect[3]), (36, 42, 48), -1)
+    cv2.rectangle(frame, (rect[0], rect[1]), (rect[2], rect[3]), color, 3)
+    return draw_text(frame, label, (rect[0] + 24, rect[1] + 14), TEXT, size=26)
+
+
+def _point_in_rect(x: int, y: int, rect: tuple[int, int, int, int]) -> bool:
+    return rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]
 
 
 def _sample_path(label: str, signer: str) -> Path:

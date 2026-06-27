@@ -7,6 +7,8 @@ src/*.egg-info/
 .mypy_cache/
 .ruff_cache/
 data/raw/**/*.npy
+data/sentences*.jsonl
+data/tts/
 data/archive_legacy_*/
 data/processed/
 models/*.pkl

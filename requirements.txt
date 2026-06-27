@@ -4,3 +4,4 @@ numpy==2.4.6
 scikit-learn==1.9.0
 joblib==1.5.3
 torch==2.11.0
+edge-tts==7.2.8

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import json
+from pathlib import Path
 
 import cv2
 import joblib
@@ -13,6 +16,7 @@ from gsl_interpreter.labels import invert_labels
 from gsl_interpreter.overlay import draw_text, draw_text_batch
 from gsl_interpreter.smoothing import PredictionSmoother
 from gsl_interpreter.torch_model import best_device, build_model
+from gsl_interpreter.tts import DEFAULT_GEORGIAN_VOICE, GeorgianTTS, TTSQueueResult
 
 WINDOW_NAME = "GSL Interpreter"
 BACKGROUND_LABELS = {"არაფერი"}
@@ -32,6 +36,7 @@ PUNCTUATION_LABELS = {
     "exclamation mark": "!",
     "ძახილის ნიშანი": "!",
 }
+SPOKEN_SAVE_EVENTS = {"manual", "recording_stop", "session_end"}
 MIN_MEAN_STEP_MOTION = 0.12
 MIN_START_END_MOTION = 0.65
 ACTIVE_STEP_MOTION = 0.08
@@ -61,13 +66,68 @@ class PredictionResult:
     confidence: float
 
 
+@dataclass(frozen=True)
+class SentenceSaveResult:
+    saved: bool
+    message: str
+    path: str
+
+
+class SentenceRecorder:
+    def __init__(self, path: str | None) -> None:
+        self.path = Path(path) if path else None
+
+    def record(
+        self,
+        sentence_words: list[str],
+        event: str,
+        source_label: str = "",
+        confidence: float | None = None,
+    ) -> SentenceSaveResult:
+        sentence = _sentence_text(sentence_words)
+        if not sentence:
+            return SentenceSaveResult(False, "Sentence empty", str(self.path or ""))
+        if self.path is None:
+            return SentenceSaveResult(False, "Sentence log disabled", "")
+
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+            "sentence": sentence,
+            "words": sentence_words.copy(),
+        }
+        if source_label:
+            record["source_label"] = source_label
+        if confidence is not None:
+            record["confidence"] = round(confidence, 6)
+
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(record, ensure_ascii=False)
+            with self.path.open("a", encoding="utf-8", newline="\n") as file:
+                file.write(line + "\n")
+                file.flush()
+            return SentenceSaveResult(True, "Saved sentence", str(self.path))
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            return SentenceSaveResult(False, f"Save failed: {reason}", str(self.path))
+
+
 def run_inference(
     model_path: str,
     camera_index: int = 0,
     width: int | None = 960,
     height: int | None = 540,
     camera_buffer: int = 1,
-    tracking_complexity: int = 0,
+    start_threshold: float = START_POSE_THRESHOLD,
+    tracking_complexity: int = 1,
+    sentence_log: str | None = "data/sentences.jsonl",
+    autosave_sentences: bool = False,
+    tts_mode: str = "saved",
+    tts_voice: str = DEFAULT_GEORGIAN_VOICE,
+    tts_rate: str = "+0%",
+    tts_volume: str = "+0%",
+    tts_cache_dir: str = "data/tts",
 ) -> None:
     from gsl_interpreter import landmarks
 
@@ -86,25 +146,41 @@ def run_inference(
     device = best_device()
     model = _load_torch_model(bundle, len(labels_by_id), device)
     smoother = PredictionSmoother(threshold=0.75, consecutive=1)
+    sentence_recorder = SentenceRecorder(sentence_log)
+    sentence_tts = GeorgianTTS(
+        mode=tts_mode,
+        voice=tts_voice,
+        rate=tts_rate,
+        volume=tts_volume,
+        cache_dir=tts_cache_dir,
+    )
     sequence: list[np.ndarray] = []
     previous_vector: np.ndarray | None = None
     motion_streak = 0
     capturing = False
     armed_label = ""
+    start_hint = ""
     cooldown_frames = 0
     feedback_text = ""
     feedback_frames = 0
     sentence_words: list[str] = []
     last_result: PredictionResult | None = None
     button_rects: dict[str, tuple[int, int, int, int]] = {}
+    recording_active = True
+    record_toggle_requested = False
     reset_requested = False
     undo_requested = False
+    save_requested = False
 
     def on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
-        nonlocal reset_requested, undo_requested
+        nonlocal record_toggle_requested, reset_requested, undo_requested, save_requested
         if event != cv2.EVENT_LBUTTONDOWN:
             return
-        if _point_in_button(x, y, button_rects.get("reset")):
+        if _point_in_button(x, y, button_rects.get("record")):
+            record_toggle_requested = True
+        elif _point_in_button(x, y, button_rects.get("save")):
+            save_requested = True
+        elif _point_in_button(x, y, button_rects.get("reset")):
             reset_requested = True
         elif _point_in_button(x, y, button_rects.get("undo")):
             undo_requested = True
@@ -113,24 +189,65 @@ def run_inference(
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
     with Camera(camera_index, width=width, height=height, buffer_size=camera_buffer) as camera:
         for frame in camera.frames():
+            if record_toggle_requested:
+                if recording_active:
+                    stop_save, tts_result = _record_and_maybe_speak(
+                        sentence_recorder,
+                        sentence_tts,
+                        sentence_words,
+                        event="recording_stop",
+                    )
+                    feedback_text = _with_tts_feedback(stop_save.message, tts_result)
+                    recording_active = False
+                else:
+                    sentence_words.clear()
+                    recording_active = True
+                    feedback_text = "Recording started"
+                    last_result = None
+                capturing = False
+                armed_label = ""
+                start_hint = ""
+                cooldown_frames = 0
+                motion_streak = 0
+                previous_vector = None
+                record_toggle_requested = False
+                feedback_frames = FEEDBACK_FRAMES
+                smoother.reset()
+                sequence.clear()
+
             if reset_requested:
+                reset_save = sentence_recorder.record(sentence_words, event="reset") if sentence_words else None
                 sentence_words.clear()
                 capturing = False
                 armed_label = ""
+                start_hint = ""
                 cooldown_frames = 0
                 motion_streak = 0
                 previous_vector = None
                 reset_requested = False
-                feedback_text = "Cleared"
+                recording_active = True
+                feedback_text = reset_save.message if reset_save and not reset_save.saved else "Cleared"
                 feedback_frames = FEEDBACK_FRAMES
                 last_result = None
                 smoother.reset()
                 sequence.clear()
 
+            if save_requested:
+                save_result, tts_result = _record_and_maybe_speak(
+                    sentence_recorder,
+                    sentence_tts,
+                    sentence_words,
+                    event="manual",
+                )
+                feedback_text = _with_tts_feedback(save_result.message, tts_result)
+                feedback_frames = FEEDBACK_FRAMES
+                save_requested = False
+
             if undo_requested:
                 removed = _undo_sentence_word(sentence_words)
                 capturing = False
                 armed_label = ""
+                start_hint = ""
                 cooldown_frames = 0
                 motion_streak = 0
                 previous_vector = None
@@ -138,10 +255,19 @@ def run_inference(
                 feedback_text = f"Removed: {removed}" if removed else "Sentence empty"
                 feedback_frames = FEEDBACK_FRAMES
                 last_result = None
+                if autosave_sentences and removed:
+                    undo_save = sentence_recorder.record(
+                        sentence_words,
+                        event="undo",
+                        source_label=removed,
+                    )
+                    if not undo_save.saved and undo_save.message != "Sentence empty":
+                        feedback_text = undo_save.message
                 smoother.reset()
                 sequence.clear()
 
             vector = extract(frame)
+            start_hint = ""
             if cooldown_frames > 0:
                 cooldown_frames -= 1
                 previous_vector = None
@@ -156,10 +282,13 @@ def run_inference(
                 sequence.append(vector)
             else:
                 if not armed_label:
-                    armed_label = _match_start_pose(vector, start_templates)
-                    previous_vector = vector if armed_label else None
-                    motion_streak = 0
-                elif previous_vector is not None:
+                    start_label, start_distance = _best_start_pose_match(vector, start_templates)
+                    if start_label and start_distance <= start_threshold:
+                        armed_label = start_label
+                    elif start_label:
+                        start_hint = f"Move: {start_label} {start_distance:.1f}"
+
+                if previous_vector is not None:
                     step_motion = float(np.linalg.norm(vector - previous_vector))
                     if step_motion >= TRIGGER_STEP_MOTION:
                         motion_streak += 1
@@ -169,6 +298,8 @@ def run_inference(
                     if motion_streak >= TRIGGER_CONSECUTIVE_FRAMES:
                         capturing = True
                         sequence = [previous_vector, vector]
+                else:
+                    motion_streak = 0
 
                 previous_vector = vector
 
@@ -184,10 +315,28 @@ def run_inference(
                         armed_label,
                     )
                     if result and result.label not in BACKGROUND_LABELS:
-                        feedback_text = _apply_sentence_label(sentence_words, result.label)
+                        if recording_active:
+                            feedback_text = _apply_sentence_label(sentence_words, result.label)
+                            if _should_speak_label(result.label):
+                                feedback_text = _with_tts_feedback(
+                                    feedback_text,
+                                    sentence_tts.speak_word(result.label),
+                                )
+                        else:
+                            feedback_text = f"Detected: {result.label}"
                         feedback_frames = FEEDBACK_FRAMES
                         last_result = result
-                        print(_sentence_text(sentence_words))
+                        if autosave_sentences and recording_active:
+                            update_save = sentence_recorder.record(
+                                sentence_words,
+                                event="update",
+                                source_label=result.label,
+                                confidence=result.confidence,
+                            )
+                            if not update_save.saved:
+                                feedback_text = update_save.message
+                        if recording_active:
+                            print(_sentence_text(sentence_words))
                     else:
                         feedback_text = "Try again"
                         feedback_frames = FEEDBACK_FRAMES
@@ -203,7 +352,10 @@ def run_inference(
                 status = feedback_text
                 feedback_frames -= 1
             else:
-                status = "Move" if armed_label else "Ready"
+                if recording_active:
+                    status = "Move" if armed_label else start_hint or "Recording"
+                else:
+                    status = "Press Record"
 
             display = frame.copy()
             progress = len(sequence) / NUM_FRAMES if capturing else 0.0
@@ -214,6 +366,7 @@ def run_inference(
                 progress,
                 armed_label,
                 last_result,
+                recording_active,
             )
             cv2.imshow(WINDOW_NAME, display)
             key = cv2.waitKey(1) & 0xFF
@@ -223,7 +376,18 @@ def run_inference(
                 reset_requested = True
             if key in {8, 127, ord("u"), ord("U")}:
                 undo_requested = True
+            if key in {10, 13, ord("s"), ord("S")}:
+                save_requested = True
+            if key in {ord("t"), ord("T"), ord(" ")}:
+                record_toggle_requested = True
 
+    if recording_active and sentence_words:
+        _record_and_maybe_speak(
+            sentence_recorder,
+            sentence_tts,
+            sentence_words,
+            event="session_end",
+        )
     cv2.destroyAllWindows()
 
 
@@ -234,6 +398,7 @@ def _draw_inference_hud(
     progress: float,
     armed_label: str,
     last_result: PredictionResult | None,
+    recording_active: bool,
 ) -> tuple[np.ndarray, dict[str, tuple[int, int, int, int]]]:
     height, width = frame.shape[:2]
     panel_width = max(300, min(390, int(width * 0.46)))
@@ -245,6 +410,7 @@ def _draw_inference_hud(
         progress,
         armed_label,
         last_result,
+        recording_active,
     )
 
     canvas = np.empty((height, width + panel_width, 3), dtype=np.uint8)
@@ -266,6 +432,7 @@ def _cached_console_panel(
     progress: float,
     armed_label: str,
     last_result: PredictionResult | None,
+    recording_active: bool,
 ) -> tuple[np.ndarray, dict[str, tuple[int, int, int, int]]]:
     last_key = (
         last_result.label,
@@ -279,6 +446,7 @@ def _cached_console_panel(
         round(progress, 2),
         armed_label,
         last_key,
+        recording_active,
     )
     if _HUD_PANEL_CACHE.get("key") == cache_key:
         return (
@@ -294,6 +462,7 @@ def _cached_console_panel(
         progress,
         armed_label,
         last_result,
+        recording_active,
     )
     _HUD_PANEL_CACHE["key"] = cache_key
     _HUD_PANEL_CACHE["panel"] = panel
@@ -309,6 +478,7 @@ def _render_console_panel(
     progress: float,
     armed_label: str,
     last_result: PredictionResult | None,
+    recording_active: bool,
 ) -> tuple[np.ndarray, dict[str, tuple[int, int, int, int]]]:
     compact = height < 420
     canvas = np.full((height, panel_width, 3), APP_BG, dtype=np.uint8)
@@ -319,7 +489,7 @@ def _render_console_panel(
     gap = 8 if compact else 12
     header_h = 48 if compact else 64
     status_h = 64 if compact else 88
-    controls_h = 74 if compact else 104
+    controls_h = 102 if compact else 128
 
     content_left = pad
     content_right = panel_width - pad
@@ -332,7 +502,8 @@ def _render_console_panel(
     transcript_bottom = max(transcript_top + 44, controls_top - gap)
 
     text_items.append(("GSL Interpreter", (content_left, header_top + 2), TEXT, 24 if not compact else 20))
-    text_items.append(("Live sentence console", (content_left, header_top + 33), MUTED_TEXT, 15 if not compact else 13))
+    mode = "Recording active" if recording_active else "Recording paused"
+    text_items.append((mode, (content_left, header_top + 33), MUTED_TEXT, 15 if not compact else 13))
     cv2.line(canvas, (content_left, header_bottom), (content_right, header_bottom), BORDER, 1)
 
     status_rect = (content_left, status_top, content_right, status_bottom)
@@ -390,6 +561,10 @@ def _render_console_panel(
     canvas = _draw_section(canvas, controls_rect)
     text_items.append(("ACTIONS", (controls_rect[0] + 14, controls_rect[1] + 10), SUBTLE_TEXT, 12))
     buttons = _control_button_rects(controls_rect, compact=compact)
+    record_label = "Stop" if recording_active else "Record"
+    record_color = DANGER if recording_active else SUCCESS
+    canvas = _draw_button(canvas, buttons["record"], record_label, record_color, text_items)
+    canvas = _draw_button(canvas, buttons["save"], "Save", SUCCESS, text_items)
     canvas = _draw_button(canvas, buttons["undo"], "Undo", ACCENT, text_items)
     canvas = _draw_button(canvas, buttons["reset"], "Reset", DANGER, text_items)
 
@@ -421,13 +596,16 @@ def _control_button_rects(
     panel_width = right - left
     gap = 8
     button_height = 34 if compact else 40
-    button_top = bottom - button_height - 14
+    first_row_top = top + 34
+    second_row_top = min(bottom - button_height - 14, first_row_top + button_height + gap)
     button_width = (panel_width - 42 - gap) // 2
-    undo_left = left + 14
-    reset_left = undo_left + button_width + gap
+    left_button = left + 14
+    right_button = left_button + button_width + gap
     return {
-        "undo": (undo_left, button_top, undo_left + button_width, button_top + button_height),
-        "reset": (reset_left, button_top, reset_left + button_width, button_top + button_height),
+        "record": (left_button, first_row_top, left_button + button_width, first_row_top + button_height),
+        "save": (right_button, first_row_top, right_button + button_width, first_row_top + button_height),
+        "undo": (left_button, second_row_top, left_button + button_width, second_row_top + button_height),
+        "reset": (right_button, second_row_top, right_button + button_width, second_row_top + button_height),
     }
 
 
@@ -567,9 +745,9 @@ def _status_label(status: str, armed_label: str) -> str:
 
 
 def _status_color(status: str) -> tuple[int, int, int]:
-    if status.startswith("Added"):
+    if status.startswith("Added") or status.startswith("Saved") or status == "Recording":
         return SUCCESS
-    if status in {"Try again", "Sentence empty"} or status.startswith("Removed"):
+    if status in {"Try again", "Sentence empty", "Press Record"} or status.startswith("Removed"):
         return WARNING
     if status.startswith("Capturing"):
         return ACCENT
@@ -606,6 +784,16 @@ def _apply_sentence_label(sentence_words: list[str], label: str) -> str:
     return f"Added: {label}"
 
 
+def _should_speak_label(label: str) -> bool:
+    normalized = label.strip().casefold()
+    return (
+        normalized not in BACKGROUND_LABELS
+        and normalized not in CLEAR_LABELS
+        and normalized not in BACKSPACE_LABELS
+        and normalized not in PUNCTUATION_LABELS
+    )
+
+
 def _undo_sentence_word(sentence_words: list[str]) -> str:
     if not sentence_words:
         return ""
@@ -614,6 +802,36 @@ def _undo_sentence_word(sentence_words: list[str]) -> str:
 
 def _sentence_text(sentence_words: list[str]) -> str:
     return " ".join(sentence_words).strip()
+
+
+def _record_sentence(
+    sentence_log: str | None,
+    sentence_words: list[str],
+    event: str,
+    source_label: str = "",
+    confidence: float | None = None,
+) -> SentenceSaveResult:
+    return SentenceRecorder(sentence_log).record(sentence_words, event, source_label, confidence)
+
+
+def _record_and_maybe_speak(
+    sentence_recorder: SentenceRecorder,
+    sentence_tts: GeorgianTTS,
+    sentence_words: list[str],
+    event: str,
+    source_label: str = "",
+    confidence: float | None = None,
+) -> tuple[SentenceSaveResult, TTSQueueResult]:
+    save_result = sentence_recorder.record(sentence_words, event, source_label, confidence)
+    if not save_result.saved or event not in SPOKEN_SAVE_EVENTS:
+        return save_result, TTSQueueResult(False, "")
+    return save_result, sentence_tts.speak_sentence(_sentence_text(sentence_words), event)
+
+
+def _with_tts_feedback(feedback: str, tts_result: TTSQueueResult) -> str:
+    if not tts_result.message:
+        return feedback
+    return f"{feedback}; {tts_result.message}"
 
 
 def _shorten_text(text: str, max_chars: int) -> str:
@@ -744,6 +962,16 @@ def _match_start_pose(
     vector: np.ndarray,
     start_templates: dict[str, np.ndarray],
 ) -> str:
+    best_label, best_distance = _best_start_pose_match(vector, start_templates)
+    if best_distance <= START_POSE_THRESHOLD:
+        return best_label
+    return ""
+
+
+def _best_start_pose_match(
+    vector: np.ndarray,
+    start_templates: dict[str, np.ndarray],
+) -> tuple[str, float]:
     best_label = ""
     best_distance = float("inf")
 
@@ -756,6 +984,4 @@ def _match_start_pose(
             best_distance = distance
             best_label = label
 
-    if best_distance <= START_POSE_THRESHOLD:
-        return best_label
-    return ""
+    return best_label, best_distance

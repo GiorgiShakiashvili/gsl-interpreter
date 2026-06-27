@@ -4,6 +4,8 @@ import argparse
 import os
 import sys
 
+from gsl_interpreter.tts import DEFAULT_GEORGIAN_VOICE, TTS_MODE_CHOICES
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m gsl_interpreter")
@@ -25,11 +27,61 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--height", default=540, type=int, help="Requested camera height")
     infer.add_argument("--camera-buffer", default=1, type=int, help="Requested camera buffer size")
     infer.add_argument(
+        "--sentence-log",
+        default="data/sentences.jsonl",
+        help="JSONL file where recognized sentence updates are saved",
+    )
+    infer.add_argument(
+        "--no-autosave-sentences",
+        dest="autosave_sentences",
+        action="store_false",
+        help="Disable backup sentence logging after each accepted sign",
+    )
+    infer.add_argument(
+        "--autosave-sentences",
+        dest="autosave_sentences",
+        action="store_true",
+        help="Enable backup sentence logging after each accepted sign",
+    )
+    infer.set_defaults(autosave_sentences=False)
+    infer.add_argument(
+        "--start-threshold",
+        default=4.5,
+        type=float,
+        help="Maximum start-pose distance accepted before motion capture begins",
+    )
+    infer.add_argument(
         "--tracking-complexity",
-        default=0,
+        default=1,
         choices=(0, 1, 2),
         type=int,
-        help="MediaPipe pose model complexity; 0 is fastest, 1/2 can improve tracking",
+        help="MediaPipe pose model complexity; 1 matches recording/training, 0 is fastest",
+    )
+    infer.add_argument(
+        "--tts-mode",
+        default="saved",
+        choices=TTS_MODE_CHOICES,
+        help="Georgian speech mode: saved sentences, recognized words, both, or off",
+    )
+    infer.add_argument(
+        "--tts-voice",
+        default=DEFAULT_GEORGIAN_VOICE,
+        help="Microsoft Georgian neural voice used by edge-tts",
+    )
+    infer.add_argument(
+        "--tts-rate",
+        default="+0%",
+        help='Speech rate passed to edge-tts, for example "+10%%" or "-10%%"',
+    )
+    infer.add_argument(
+        "--tts-volume",
+        default="+0%",
+        help='Speech volume passed to edge-tts, for example "+0%%"',
+    )
+    infer.add_argument(
+        "--tts-cache-dir",
+        default="data/tts",
+        help="Directory for cached Georgian TTS MP3 files",
     )
 
     return parser
@@ -61,7 +113,15 @@ def main() -> None:
             width=args.width,
             height=args.height,
             camera_buffer=args.camera_buffer,
+            start_threshold=args.start_threshold,
             tracking_complexity=args.tracking_complexity,
+            sentence_log=args.sentence_log,
+            autosave_sentences=args.autosave_sentences,
+            tts_mode=args.tts_mode,
+            tts_voice=args.tts_voice,
+            tts_rate=args.tts_rate,
+            tts_volume=args.tts_volume,
+            tts_cache_dir=args.tts_cache_dir,
         )
     else:
         raise ValueError(f"Unknown command: {args.command}")

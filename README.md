@@ -29,6 +29,8 @@ Record samples for a label. For the high-accuracy body-relative model, prefer 30
 .\.venv\Scripts\python.exe -m gsl_interpreter record --label "გამარჯობა" --samples 40 --signer giorgi
 ```
 
+After each captured sample, use the in-window `Save` or `Discard` buttons. Keyboard shortcuts still work: `Y`/Enter/`S` saves, `N`/Esc/`D` discards.
+
 Train a classifier:
 
 ```powershell
@@ -43,12 +45,12 @@ Run live inference:
 .\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl
 ```
 
-Inference runs the PyTorch sequence model and per-sequence motion feature construction on CUDA when available. MediaPipe hand/body tracking and OpenCV camera/display still run on CPU in this prototype; the default inference camera settings request a lower-latency 960x540 stream and faster MediaPipe tracking to reduce lag.
+Inference runs the PyTorch sequence model and per-sequence motion feature construction on CUDA when available. MediaPipe hand/body tracking and OpenCV camera/display still run on CPU in this prototype; the default inference camera settings request a lower-latency 960x540 stream.
 
-If tracking accuracy drops, raise the MediaPipe pose model complexity:
+Normal inference uses MediaPipe tracking complexity `1`, matching recording/training. If you want the fastest tracker and can tolerate lower matching accuracy:
 
 ```powershell
-.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tracking-complexity 1
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tracking-complexity 0
 ```
 
 If the camera is still laggy, lower the requested camera size:
@@ -57,14 +59,40 @@ If the camera is still laggy, lower the requested camera size:
 .\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --width 640 --height 360
 ```
 
-The live inference window now builds a sentence instead of locking after one word:
+If the UI stays on `Align: <label> <distance>` and never starts capture, raise the start-pose threshold slightly:
 
-- Each accepted sign is appended to the on-screen sentence.
+```powershell
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --start-threshold 6.0
+```
+
+The live inference window now records sentences instead of locking after one word:
+
+- Sentence recording starts automatically when inference opens.
+- Each accepted sign is appended to the on-screen sentence while recording is active.
+- Press `Stop`, `T`, or Space to save the final sentence to `data/sentences.jsonl`.
+- Press `Record`, `T`, or Space again to start a fresh sentence.
 - The terminal prints the full sentence after each accepted sign.
+- Backup autosave of every accepted update is optional with `--autosave-sentences`.
 - The inference view shows a clean camera feed with a right-side operator console for sentence text, recognition status, capture progress, recent word chips, actions, and last-confidence metadata.
-- Use the `Reset` button or `R` to clear the sentence.
+- Use the `Save` button, `S`, or Enter to explicitly save the current sentence.
+- Use the `Reset` button or `R` to clear the sentence. Reset and app exit also preserve the current sentence in the log before clearing/exiting.
 - Use the `Undo` button, `U`, or Backspace to remove the last word.
 - If you later train punctuation/control labels, `წერტილი`/`period`, `მძიმე`/`comma`, `კითხვის ნიშანი`/`question mark`, and `ძახილის ნიშანი`/`exclamation mark` are handled specially.
+
+Georgian TTS is enabled by default for saved sentences through `edge-tts` using the Microsoft `ka-GE-EkaNeural` voice. It needs internet the first time it synthesizes a new phrase, then caches MP3 files under `data/tts/`.
+
+```powershell
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-mode saved
+```
+
+Use word-by-word speech while recording, speak both words and saved sentences, switch to the male Georgian voice, or disable speech:
+
+```powershell
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-mode words
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-mode all
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-voice ka-GE-GiorgiNeural
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tts-mode off
+```
 
 ## Data Contract
 
