@@ -21,6 +21,16 @@ def build_parser() -> argparse.ArgumentParser:
     infer = subparsers.add_parser("infer", help="Run live webcam inference")
     infer.add_argument("--model", default="models/classifier.pkl", help="Model artifact path")
     infer.add_argument("--camera", default=0, type=int, help="OpenCV camera index")
+    infer.add_argument("--width", default=960, type=int, help="Requested camera width")
+    infer.add_argument("--height", default=540, type=int, help="Requested camera height")
+    infer.add_argument("--camera-buffer", default=1, type=int, help="Requested camera buffer size")
+    infer.add_argument(
+        "--tracking-complexity",
+        default=0,
+        choices=(0, 1, 2),
+        type=int,
+        help="MediaPipe pose model complexity; 0 is fastest, 1/2 can improve tracking",
+    )
 
     return parser
 
@@ -45,7 +55,14 @@ def main() -> None:
     elif args.command == "infer":
         from gsl_interpreter.infer import run_inference
 
-        run_inference(args.model, camera_index=args.camera)
+        run_inference(
+            args.model,
+            camera_index=args.camera,
+            width=args.width,
+            height=args.height,
+            camera_buffer=args.camera_buffer,
+            tracking_complexity=args.tracking_complexity,
+        )
     else:
         raise ValueError(f"Unknown command: {args.command}")
 

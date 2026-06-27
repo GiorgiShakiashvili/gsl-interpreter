@@ -43,12 +43,25 @@ Run live inference:
 .\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl
 ```
 
-Inference also runs the PyTorch sequence model on CUDA when available. MediaPipe hand/body tracking still runs on CPU in this prototype.
+Inference runs the PyTorch sequence model and per-sequence motion feature construction on CUDA when available. MediaPipe hand/body tracking and OpenCV camera/display still run on CPU in this prototype; the default inference camera settings request a lower-latency 960x540 stream and faster MediaPipe tracking to reduce lag.
+
+If tracking accuracy drops, raise the MediaPipe pose model complexity:
+
+```powershell
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --tracking-complexity 1
+```
+
+If the camera is still laggy, lower the requested camera size:
+
+```powershell
+.\.venv\Scripts\python.exe -m gsl_interpreter infer --model models/classifier.pkl --width 640 --height 360
+```
 
 The live inference window now builds a sentence instead of locking after one word:
 
 - Each accepted sign is appended to the on-screen sentence.
 - The terminal prints the full sentence after each accepted sign.
+- The inference view shows a clean camera feed with a right-side operator console for sentence text, recognition status, capture progress, recent word chips, actions, and last-confidence metadata.
 - Use the `Reset` button or `R` to clear the sentence.
 - Use the `Undo` button, `U`, or Backspace to remove the last word.
 - If you later train punctuation/control labels, `წერტილი`/`period`, `მძიმე`/`comma`, `კითხვის ნიშანი`/`question mark`, and `ძახილის ნიშანი`/`exclamation mark` are handled specially.

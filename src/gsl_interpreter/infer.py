@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import cv2
 import joblib
 import numpy as np
@@ -7,16 +9,12 @@ import torch
 
 from gsl_interpreter import FEATURE_VERSION, NUM_FRAMES
 from gsl_interpreter.camera import Camera
-from gsl_interpreter.features import add_motion_features
 from gsl_interpreter.labels import invert_labels
-from gsl_interpreter.overlay import draw_text
+from gsl_interpreter.overlay import draw_text, draw_text_batch
 from gsl_interpreter.smoothing import PredictionSmoother
 from gsl_interpreter.torch_model import best_device, build_model
 
 WINDOW_NAME = "GSL Interpreter"
-RESET_BUTTON = (20, 105, 170, 155)
-UNDO_BUTTON = (190, 105, 340, 155)
-YELLOW = (0, 255, 255)
 BACKGROUND_LABELS = {"არაფერი"}
 BACKSPACE_LABELS = {"backspace", "delete", "undo", "წაშლა", "უკან"}
 CLEAR_LABELS = {"clear", "reset", "გასუფთავება", "გასუფთავე"}
@@ -43,10 +41,38 @@ TRIGGER_CONSECUTIVE_FRAMES = 3
 START_POSE_THRESHOLD = 4.5
 POST_ACCEPT_COOLDOWN_FRAMES = 18
 FEEDBACK_FRAMES = 28
+APP_BG = (16, 18, 21)
+PANEL_BG = (25, 28, 32)
+PANEL_BG_SOFT = (38, 43, 49)
+BORDER = (67, 74, 82)
+TEXT = (238, 241, 243)
+MUTED_TEXT = (154, 164, 172)
+SUBTLE_TEXT = (109, 119, 128)
+ACCENT = (210, 143, 62)
+SUCCESS = (124, 184, 92)
+WARNING = (54, 172, 222)
+DANGER = (72, 82, 212)
+_HUD_PANEL_CACHE: dict[str, object] = {}
 
 
-def run_inference(model_path: str, camera_index: int = 0) -> None:
-    from gsl_interpreter.landmarks import extract
+@dataclass(frozen=True)
+class PredictionResult:
+    label: str
+    confidence: float
+
+
+def run_inference(
+    model_path: str,
+    camera_index: int = 0,
+    width: int | None = 960,
+    height: int | None = 540,
+    camera_buffer: int = 1,
+    tracking_complexity: int = 0,
+) -> None:
+    from gsl_interpreter import landmarks
+
+    landmarks.configure(model_complexity=tracking_complexity)
+    extract = landmarks.extract
 
     bundle = joblib.load(model_path)
     if bundle.get("feature_version") != FEATURE_VERSION:
@@ -69,6 +95,8 @@ def run_inference(model_path: str, camera_index: int = 0) -> None:
     feedback_text = ""
     feedback_frames = 0
     sentence_words: list[str] = []
+    last_result: PredictionResult | None = None
+    button_rects: dict[str, tuple[int, int, int, int]] = {}
     reset_requested = False
     undo_requested = False
 
@@ -76,14 +104,14 @@ def run_inference(model_path: str, camera_index: int = 0) -> None:
         nonlocal reset_requested, undo_requested
         if event != cv2.EVENT_LBUTTONDOWN:
             return
-        if _point_in_button(x, y, RESET_BUTTON):
+        if _point_in_button(x, y, button_rects.get("reset")):
             reset_requested = True
-        elif _point_in_button(x, y, UNDO_BUTTON):
+        elif _point_in_button(x, y, button_rects.get("undo")):
             undo_requested = True
 
     cv2.namedWindow(WINDOW_NAME)
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
-    with Camera(camera_index) as camera:
+    with Camera(camera_index, width=width, height=height, buffer_size=camera_buffer) as camera:
         for frame in camera.frames():
             if reset_requested:
                 sentence_words.clear()
@@ -95,6 +123,7 @@ def run_inference(model_path: str, camera_index: int = 0) -> None:
                 reset_requested = False
                 feedback_text = "Cleared"
                 feedback_frames = FEEDBACK_FRAMES
+                last_result = None
                 smoother.reset()
                 sequence.clear()
 
@@ -108,6 +137,7 @@ def run_inference(model_path: str, camera_index: int = 0) -> None:
                 undo_requested = False
                 feedback_text = f"Removed: {removed}" if removed else "Sentence empty"
                 feedback_frames = FEEDBACK_FRAMES
+                last_result = None
                 smoother.reset()
                 sequence.clear()
 
@@ -145,7 +175,7 @@ def run_inference(model_path: str, camera_index: int = 0) -> None:
             if capturing:
                 status = f"Capturing {len(sequence)}/{NUM_FRAMES}"
                 if len(sequence) >= NUM_FRAMES:
-                    prediction = _predict_sequence(
+                    result = _predict_sequence(
                         sequence,
                         model,
                         labels_by_id,
@@ -153,9 +183,10 @@ def run_inference(model_path: str, camera_index: int = 0) -> None:
                         smoother,
                         armed_label,
                     )
-                    if prediction and prediction not in BACKGROUND_LABELS:
-                        feedback_text = _apply_sentence_label(sentence_words, prediction)
+                    if result and result.label not in BACKGROUND_LABELS:
+                        feedback_text = _apply_sentence_label(sentence_words, result.label)
                         feedback_frames = FEEDBACK_FRAMES
+                        last_result = result
                         print(_sentence_text(sentence_words))
                     else:
                         feedback_text = "Try again"
@@ -175,8 +206,15 @@ def run_inference(model_path: str, camera_index: int = 0) -> None:
                 status = "Move" if armed_label else "Ready"
 
             display = frame.copy()
-            display = _draw_sentence_overlay(display, sentence_words, status)
-            display = _draw_buttons(display)
+            progress = len(sequence) / NUM_FRAMES if capturing else 0.0
+            display, button_rects = _draw_inference_hud(
+                display,
+                sentence_words,
+                status,
+                progress,
+                armed_label,
+                last_result,
+            )
             cv2.imshow(WINDOW_NAME, display)
             key = cv2.waitKey(1) & 0xFF
             if key == 27:
@@ -189,25 +227,358 @@ def run_inference(model_path: str, camera_index: int = 0) -> None:
     cv2.destroyAllWindows()
 
 
-def _draw_buttons(frame: np.ndarray) -> np.ndarray:
-    frame = _draw_button(frame, RESET_BUTTON, "Reset")
-    return _draw_button(frame, UNDO_BUTTON, "Undo")
+def _draw_inference_hud(
+    frame: np.ndarray,
+    sentence_words: list[str],
+    status: str,
+    progress: float,
+    armed_label: str,
+    last_result: PredictionResult | None,
+) -> tuple[np.ndarray, dict[str, tuple[int, int, int, int]]]:
+    height, width = frame.shape[:2]
+    panel_width = max(300, min(390, int(width * 0.46)))
+    panel, local_buttons = _cached_console_panel(
+        height,
+        panel_width,
+        sentence_words,
+        status,
+        progress,
+        armed_label,
+        last_result,
+    )
+
+    canvas = np.empty((height, width + panel_width, 3), dtype=np.uint8)
+    canvas[:, :width] = frame
+    canvas[:, width:] = panel
+    _draw_camera_badge(canvas)
+    buttons = {
+        key: (rect[0] + width, rect[1], rect[2] + width, rect[3])
+        for key, rect in local_buttons.items()
+    }
+    return canvas, buttons
 
 
-def _draw_button(frame: np.ndarray, rect: tuple[int, int, int, int], label: str) -> np.ndarray:
+def _cached_console_panel(
+    height: int,
+    panel_width: int,
+    sentence_words: list[str],
+    status: str,
+    progress: float,
+    armed_label: str,
+    last_result: PredictionResult | None,
+) -> tuple[np.ndarray, dict[str, tuple[int, int, int, int]]]:
+    last_key = (
+        last_result.label,
+        round(last_result.confidence, 3),
+    ) if last_result else None
+    cache_key = (
+        height,
+        panel_width,
+        tuple(sentence_words),
+        status,
+        round(progress, 2),
+        armed_label,
+        last_key,
+    )
+    if _HUD_PANEL_CACHE.get("key") == cache_key:
+        return (
+            _HUD_PANEL_CACHE["panel"],  # type: ignore[return-value]
+            _HUD_PANEL_CACHE["buttons"],  # type: ignore[return-value]
+        )
+
+    panel, buttons = _render_console_panel(
+        height,
+        panel_width,
+        sentence_words,
+        status,
+        progress,
+        armed_label,
+        last_result,
+    )
+    _HUD_PANEL_CACHE["key"] = cache_key
+    _HUD_PANEL_CACHE["panel"] = panel
+    _HUD_PANEL_CACHE["buttons"] = buttons
+    return panel, buttons
+
+
+def _render_console_panel(
+    height: int,
+    panel_width: int,
+    sentence_words: list[str],
+    status: str,
+    progress: float,
+    armed_label: str,
+    last_result: PredictionResult | None,
+) -> tuple[np.ndarray, dict[str, tuple[int, int, int, int]]]:
+    compact = height < 420
+    canvas = np.full((height, panel_width, 3), APP_BG, dtype=np.uint8)
+    cv2.line(canvas, (0, 0), (0, height), BORDER, 1)
+    text_items: list[tuple[str, tuple[int, int], tuple[int, int, int], int]] = []
+
+    pad = 14 if compact else 20
+    gap = 8 if compact else 12
+    header_h = 48 if compact else 64
+    status_h = 64 if compact else 88
+    controls_h = 74 if compact else 104
+
+    content_left = pad
+    content_right = panel_width - pad
+    header_top = pad
+    header_bottom = header_top + header_h
+    status_top = header_bottom + gap
+    status_bottom = status_top + status_h
+    controls_top = height - pad - controls_h
+    transcript_top = status_bottom + gap
+    transcript_bottom = max(transcript_top + 44, controls_top - gap)
+
+    text_items.append(("GSL Interpreter", (content_left, header_top + 2), TEXT, 24 if not compact else 20))
+    text_items.append(("Live sentence console", (content_left, header_top + 33), MUTED_TEXT, 15 if not compact else 13))
+    cv2.line(canvas, (content_left, header_bottom), (content_right, header_bottom), BORDER, 1)
+
+    status_rect = (content_left, status_top, content_right, status_bottom)
+    canvas = _draw_section(canvas, status_rect)
+    status_label = _status_label(status, armed_label)
+    status_color = _status_color(status)
+    indicator_rect = (status_rect[0] + 14, status_rect[1] + 18, status_rect[0] + 20, status_rect[3] - 18)
+    canvas = _draw_round_rect_alpha(canvas, indicator_rect, status_color, alpha=1.0, radius=3)
+    text_items.append(("RECOGNITION", (status_rect[0] + 32, status_rect[1] + 11), SUBTLE_TEXT, 12))
+    text_items.append(
+        (
+            _shorten_text(status_label, max(14, (status_rect[2] - status_rect[0]) // 12)),
+            (status_rect[0] + 32, status_rect[1] + 32),
+            TEXT,
+            20 if not compact else 17,
+        )
+    )
+    if progress > 0:
+        bar_rect = (status_rect[0] + 32, status_rect[3] - 18, status_rect[2] - 14, status_rect[3] - 11)
+        canvas = _draw_progress_bar(canvas, bar_rect, progress)
+
+    transcript_rect = (content_left, transcript_top, content_right, transcript_bottom)
+    canvas = _draw_section(canvas, transcript_rect)
+    text_items.append(("TRANSCRIPT", (transcript_rect[0] + 14, transcript_rect[1] + 12), SUBTLE_TEXT, 12))
+
+    sentence_text = _sentence_text(sentence_words) or "No sentence yet"
+    max_chars = max(18, (transcript_rect[2] - transcript_rect[0] - 28) // (11 if compact else 13))
+    max_lines = max(1, min(4, (transcript_rect[3] - transcript_rect[1] - 82) // (26 if compact else 32)))
+    lines = _wrap_text(sentence_text, max_chars=max_chars, max_lines=max_lines)
+    line_y = transcript_rect[1] + 38
+    text_size = 20 if compact else 24
+    for line in lines:
+        text_items.append((line, (transcript_rect[0] + 14, line_y), TEXT, text_size))
+        line_y += 28 if compact else 34
+
+    if last_result:
+        confidence = int(round(last_result.confidence * 100))
+        meta = f"Last detection: {_shorten_text(last_result.label, 18)}  Confidence {confidence}%"
+    else:
+        meta = "Last detection: none"
+    text_items.append((meta, (transcript_rect[0] + 14, transcript_rect[3] - 51), MUTED_TEXT, 14))
+
+    chip_y = transcript_rect[3] - 26
+    chip_x = transcript_rect[0] + 14
+    for chip in sentence_words[-3 if compact else -4:]:
+        chip_label = _shorten_text(chip, 14)
+        chip_width = 22 + len(chip_label) * 9
+        if chip_x + chip_width > transcript_rect[2] - 14:
+            break
+        chip_rect = (chip_x, chip_y, chip_x + chip_width, chip_y + 20)
+        canvas = _draw_chip(canvas, chip_rect, chip_label, text_items)
+        chip_x += chip_width + 6
+
+    controls_rect = (content_left, controls_top, content_right, height - pad)
+    canvas = _draw_section(canvas, controls_rect)
+    text_items.append(("ACTIONS", (controls_rect[0] + 14, controls_rect[1] + 10), SUBTLE_TEXT, 12))
+    buttons = _control_button_rects(controls_rect, compact=compact)
+    canvas = _draw_button(canvas, buttons["undo"], "Undo", ACCENT, text_items)
+    canvas = _draw_button(canvas, buttons["reset"], "Reset", DANGER, text_items)
+
+    canvas = draw_text_batch(canvas, text_items)
+    return canvas, buttons
+
+
+def _draw_camera_badge(canvas: np.ndarray) -> None:
+    rect = (16, 16, 142, 42)
+    _draw_round_rect_alpha_in_place(canvas, rect, PANEL_BG, alpha=0.82, radius=6)
+    _draw_round_rect(canvas, rect, BORDER, thickness=1, radius=6)
+    cv2.putText(
+        canvas,
+        "CAMERA 01",
+        (30, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        TEXT,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def _control_button_rects(
+    panel_rect: tuple[int, int, int, int],
+    compact: bool,
+) -> dict[str, tuple[int, int, int, int]]:
+    left, top, right, bottom = panel_rect
+    panel_width = right - left
+    gap = 8
+    button_height = 34 if compact else 40
+    button_top = bottom - button_height - 14
+    button_width = (panel_width - 42 - gap) // 2
+    undo_left = left + 14
+    reset_left = undo_left + button_width + gap
+    return {
+        "undo": (undo_left, button_top, undo_left + button_width, button_top + button_height),
+        "reset": (reset_left, button_top, reset_left + button_width, button_top + button_height),
+    }
+
+
+def _draw_section(frame: np.ndarray, rect: tuple[int, int, int, int]) -> np.ndarray:
+    frame = _draw_round_rect_alpha(frame, rect, PANEL_BG, alpha=1.0, radius=8)
+    _draw_round_rect(frame, rect, BORDER, thickness=1, radius=8)
+    return frame
+
+
+def _draw_button(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    label: str,
+    color: tuple[int, int, int],
+    text_items: list[tuple[str, tuple[int, int], tuple[int, int, int], int]],
+) -> np.ndarray:
+    frame = _draw_round_rect_alpha(frame, rect, PANEL_BG_SOFT, alpha=0.82, radius=8)
+    _draw_round_rect(frame, rect, color, thickness=2, radius=8)
+    text_x = rect[0] + 18
+    text_y = rect[1] + 9
+    text_items.append((label, (text_x, text_y), TEXT, 22))
+    return frame
+
+
+def _draw_chip(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    label: str,
+    text_items: list[tuple[str, tuple[int, int], tuple[int, int, int], int]],
+) -> np.ndarray:
+    frame = _draw_round_rect_alpha(frame, rect, PANEL_BG_SOFT, alpha=0.9, radius=8)
+    _draw_round_rect(frame, rect, ACCENT, thickness=1, radius=8)
+    text_items.append((label, (rect[0] + 10, rect[1] + 3), TEXT, 16))
+    return frame
+
+
+def _draw_pill(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    label: str,
+    color: tuple[int, int, int],
+) -> np.ndarray:
+    frame = _draw_round_rect_alpha(frame, rect, PANEL_BG_SOFT, alpha=0.86, radius=8)
+    _draw_round_rect(frame, rect, color, thickness=2, radius=8)
+    return draw_text(frame, label, (rect[0] + 14, rect[1] + 7), TEXT, size=18)
+
+
+def _draw_progress_bar(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    progress: float,
+) -> np.ndarray:
+    progress = max(0.0, min(1.0, progress))
+    frame = _draw_round_rect_alpha(frame, rect, PANEL_BG_SOFT, alpha=0.85, radius=4)
     left, top, right, bottom = rect
-    cv2.rectangle(frame, (left, top), (right, bottom), YELLOW, 2)
-    return draw_text(frame, label, (left + 20, top + 8), YELLOW, size=28)
+    fill_right = left + int((right - left) * progress)
+    if fill_right > left:
+        _draw_round_rect(frame, (left, top, fill_right, bottom), SUCCESS, thickness=-1, radius=4)
+    return frame
 
 
-def _draw_sentence_overlay(frame: np.ndarray, sentence_words: list[str], status: str) -> np.ndarray:
-    sentence = _sentence_text(sentence_words) or "..."
-    sentence = _shorten_text(sentence, max(18, frame.shape[1] // 17))
-    frame = draw_text(frame, f"Sentence: {sentence}", (20, 25), YELLOW, size=34)
-    return draw_text(frame, f"Status: {status}", (20, 68), YELLOW, size=28)
+def _draw_glass_panel(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    alpha: float,
+) -> np.ndarray:
+    frame = _draw_round_rect_alpha(frame, rect, PANEL_BG, alpha=alpha, radius=8)
+    _draw_round_rect(frame, rect, (64, 68, 74), thickness=1, radius=8)
+    return frame
 
 
-def _point_in_button(x: int, y: int, rect: tuple[int, int, int, int]) -> bool:
+def _draw_round_rect_alpha(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    color: tuple[int, int, int],
+    alpha: float,
+    radius: int,
+) -> np.ndarray:
+    overlay = frame.copy()
+    _draw_round_rect(overlay, rect, color, thickness=-1, radius=radius)
+    return cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+
+def _draw_round_rect_alpha_in_place(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    color: tuple[int, int, int],
+    alpha: float,
+    radius: int,
+) -> None:
+    overlay = frame.copy()
+    _draw_round_rect(overlay, rect, color, thickness=-1, radius=radius)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
+
+
+def _draw_round_rect(
+    frame: np.ndarray,
+    rect: tuple[int, int, int, int],
+    color: tuple[int, int, int],
+    thickness: int,
+    radius: int,
+) -> None:
+    left, top, right, bottom = rect
+    radius = max(0, min(radius, (right - left) // 2, (bottom - top) // 2))
+    if radius == 0:
+        cv2.rectangle(frame, (left, top), (right, bottom), color, thickness)
+        return
+
+    if thickness < 0:
+        cv2.rectangle(frame, (left + radius, top), (right - radius, bottom), color, thickness)
+        cv2.rectangle(frame, (left, top + radius), (right, bottom - radius), color, thickness)
+        for x, y in (
+            (left + radius, top + radius),
+            (right - radius, top + radius),
+            (left + radius, bottom - radius),
+            (right - radius, bottom - radius),
+        ):
+            cv2.circle(frame, (x, y), radius, color, thickness)
+        return
+
+    cv2.line(frame, (left + radius, top), (right - radius, top), color, thickness)
+    cv2.line(frame, (left + radius, bottom), (right - radius, bottom), color, thickness)
+    cv2.line(frame, (left, top + radius), (left, bottom - radius), color, thickness)
+    cv2.line(frame, (right, top + radius), (right, bottom - radius), color, thickness)
+    cv2.ellipse(frame, (left + radius, top + radius), (radius, radius), 180, 0, 90, color, thickness)
+    cv2.ellipse(frame, (right - radius, top + radius), (radius, radius), 270, 0, 90, color, thickness)
+    cv2.ellipse(frame, (right - radius, bottom - radius), (radius, radius), 0, 0, 90, color, thickness)
+    cv2.ellipse(frame, (left + radius, bottom - radius), (radius, radius), 90, 0, 90, color, thickness)
+
+
+def _status_label(status: str, armed_label: str) -> str:
+    if status == "Ready":
+        return "Ready"
+    if status == "Move" and armed_label:
+        return f"Armed: {armed_label}"
+    return status
+
+
+def _status_color(status: str) -> tuple[int, int, int]:
+    if status.startswith("Added"):
+        return SUCCESS
+    if status in {"Try again", "Sentence empty"} or status.startswith("Removed"):
+        return WARNING
+    if status.startswith("Capturing"):
+        return ACCENT
+    return MUTED_TEXT
+
+
+def _point_in_button(x: int, y: int, rect: tuple[int, int, int, int] | None) -> bool:
+    if rect is None:
+        return False
     left, top, right, bottom = rect
     return left <= x <= right and top <= y <= bottom
 
@@ -253,6 +624,34 @@ def _shorten_text(text: str, max_chars: int) -> str:
     return "..." + text[-(max_chars - 3) :]
 
 
+def _wrap_text(text: str, max_chars: int, max_lines: int) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+
+    words = text.split()
+    if not words:
+        return [_shorten_text(text, max_chars)]
+
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        current = word
+        if len(lines) == max_lines - 1:
+            break
+
+    if current and len(lines) < max_lines:
+        remaining = " ".join(words[sum(len(line.split()) for line in lines) :])
+        lines.append(_shorten_text(remaining or current, max_chars))
+
+    return lines[:max_lines] or [_shorten_text(text, max_chars)]
+
+
 def _predict_sequence(
     sequence: list[np.ndarray],
     model: torch.nn.Module,
@@ -260,26 +659,48 @@ def _predict_sequence(
     allowed_labels: set[str],
     smoother: PredictionSmoother,
     expected_label: str,
-) -> str:
-    if not _has_dynamic_motion(sequence):
-        smoother.reset()
-        return ""
-
+) -> PredictionResult | None:
     device = next(model.parameters()).device
-    x_features = add_motion_features(np.stack(sequence).astype(np.float32))
-    x = torch.from_numpy(x_features).unsqueeze(0).to(device)
-    with torch.no_grad():
+    frames = torch.from_numpy(np.stack(sequence).astype(np.float32)).to(device, non_blocking=True)
+    if not _has_dynamic_motion_tensor(frames):
+        smoother.reset()
+        return None
+
+    x = _add_motion_features_tensor(frames).unsqueeze(0)
+    autocast_enabled = device.type == "cuda"
+    with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=autocast_enabled):
         probabilities = torch.softmax(model(x), dim=1)[0].detach().cpu().numpy()
     class_id = int(np.argmax(probabilities))
     confidence = float(probabilities[class_id])
     prediction = labels_by_id[class_id]
     if prediction not in allowed_labels:
         smoother.reset()
-        return ""
+        return None
     if expected_label and prediction != expected_label:
         smoother.reset()
-        return ""
-    return smoother.update(prediction, confidence) or ""
+        return None
+    stable_label = smoother.update(prediction, confidence)
+    if not stable_label:
+        return None
+    return PredictionResult(stable_label, confidence)
+
+
+def _add_motion_features_tensor(frames: torch.Tensor) -> torch.Tensor:
+    deltas = torch.zeros_like(frames)
+    deltas[1:] = frames[1:] - frames[:-1]
+    return torch.cat((frames, deltas), dim=1)
+
+
+def _has_dynamic_motion_tensor(frames: torch.Tensor) -> bool:
+    step_motion = torch.linalg.vector_norm(torch.diff(frames, dim=0), dim=1)
+    mean_step_motion = float(step_motion.mean().item())
+    start_end_motion = float(torch.linalg.vector_norm(frames[-1] - frames[0]).item())
+    active_steps = int(torch.count_nonzero(step_motion >= ACTIVE_STEP_MOTION).item())
+    return (
+        mean_step_motion >= MIN_MEAN_STEP_MOTION
+        and start_end_motion >= MIN_START_END_MOTION
+        and active_steps >= MIN_ACTIVE_STEPS
+    )
 
 
 def _load_torch_model(
@@ -298,6 +719,10 @@ def _load_torch_model(
         raise RuntimeError("Model artifact is missing state_dict.")
     model.load_state_dict(state_dict)
     model.eval()
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     print(f"Using device: {device}")
     return model
 

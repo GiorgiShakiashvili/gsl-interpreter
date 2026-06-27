@@ -21,12 +21,37 @@ from gsl_interpreter import FEATURE_SIZE
 
 _mp_holistic = mp.solutions.holistic
 _holistic: object | None = None
+_model_complexity = 1
+_min_detection_confidence = 0.6
+_min_tracking_confidence = 0.6
 
 LOCAL_RIGHT_SLOT = slice(0, 63)
 LOCAL_LEFT_SLOT = slice(63, 126)
 BODY_RIGHT_SLOT = slice(126, 189)
 BODY_LEFT_SLOT = slice(189, 252)
 POSE_SLOT = slice(252, 351)
+
+
+def configure(
+    *,
+    model_complexity: int | None = None,
+    min_detection_confidence: float | None = None,
+    min_tracking_confidence: float | None = None,
+) -> None:
+    """Configure MediaPipe Holistic before extraction starts."""
+    global _holistic, _model_complexity, _min_detection_confidence, _min_tracking_confidence
+    if model_complexity is not None:
+        _model_complexity = model_complexity
+    if min_detection_confidence is not None:
+        _min_detection_confidence = min_detection_confidence
+    if min_tracking_confidence is not None:
+        _min_tracking_confidence = min_tracking_confidence
+
+    if _holistic is not None:
+        close = getattr(_holistic, "close", None)
+        if callable(close):
+            close()
+        _holistic = None
 
 
 def extract(frame: np.ndarray) -> np.ndarray | None:
@@ -109,11 +134,11 @@ def _get_holistic() -> object:
         with _suppress_native_stderr():
             _holistic = _mp_holistic.Holistic(
                 static_image_mode=False,
-                model_complexity=1,
+                model_complexity=_model_complexity,
                 smooth_landmarks=True,
                 refine_face_landmarks=False,
-                min_detection_confidence=0.6,
-                min_tracking_confidence=0.6,
+                min_detection_confidence=_min_detection_confidence,
+                min_tracking_confidence=_min_tracking_confidence,
             )
     return _holistic
 
