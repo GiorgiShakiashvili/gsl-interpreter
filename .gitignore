@@ -1,0 +1,12 @@
+.venv/
+.runtime/
+__pycache__/
+*.py[cod]
+src/*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+data/raw/**/*.npy
+data/archive_legacy_*/
+data/processed/
+models/*.pkl
